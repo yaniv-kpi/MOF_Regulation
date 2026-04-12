@@ -1,42 +1,36 @@
 """
 Crawler for https://www.gov.il/he/pages/information-entities-codex
 
-Strategy:
-1. First try gov.il's public JSON API endpoints (used by their own SPA).
-2. Fall back to HTML scraping with BeautifulSoup.
-3. For each document page, extract title + text content.
-4. PDF links are downloaded and text is extracted.
-5. All documents are upserted into the PostgreSQL `documents` table.
+The gov.il portal is protected by Reblaze WAF which blocks plain HTTP scrapers
+(returns 403). We use Playwright (headless Chromium) to render the page like a
+real browser, extract every document link from the rendered DOM, then download
+and index each document.
+
+Flow:
+  1. Playwright renders CODEX_URL and extracts all BlobFolder / PDF / DOCX links.
+  2. Fallback: if Playwright fails, a curated list of known URLs is used.
+  3. Each document URL is downloaded via httpx (files are publicly accessible).
+  4. Text is extracted from PDF / DOCX / HTML.
+  5. Documents are upserted into PostgreSQL with the ORIGINAL gov.il URL as
+     the link shown to users — so "Open document" always goes to gov.il directly.
 """
 
 import asyncio
 import logging
 import re
-import json
-from typing import Optional
 from urllib.parse import urljoin, urlparse
 
 import httpx
-from bs4 import BeautifulSoup
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 
 from ..models import Document
-from .text_extractor import extract_text_from_html, extract_text_from_pdf, clean_text
+from .text_extractor import extract_text_from_bytes, clean_text
 
 logger = logging.getLogger(__name__)
 
-GOVIL_BASE = "https://www.gov.il"
-CODEX_URL = f"{GOVIL_BASE}/he/pages/information-entities-codex"
-
-# Gov.il uses a REST API for their content management system.
-# These endpoints return JSON lists of documents.
-GOVIL_API_ENDPOINTS = [
-    # The codex / open legislation pages
-    f"{GOVIL_BASE}/he/api/pages/information-entities-codex",
-    # Generic search/list endpoint (returns paginated JSON)
-    f"{GOVIL_BASE}/he/api/GovExternalIntegration/govexternalintegration/GetGovEntitiesFilteredList",
-]
+CODEX_URL = "https://www.gov.il/he/pages/information-entities-codex"
+BLOB_BASE = "https://www.gov.il/BlobFolder/guide/information-entities-codex/he/"
 
 HEADERS = {
     "User-Agent": (
@@ -45,365 +39,223 @@ HEADERS = {
         "Chrome/120.0.0.0 Safari/537.36"
     ),
     "Accept-Language": "he-IL,he;q=0.9,en-US;q=0.8",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
+
+# ─── Curated fallback list ────────────────────────────────────────────────────
+# Discovered by inspecting Google-indexed URLs from the codex BlobFolder.
+# The crawler extends this list dynamically from the live page; this is the
+# minimum baseline that always works even when Playwright isn't available.
+KNOWN_URLS: list[tuple[str, str]] = [
+    (f"{BLOB_BASE}Codex_codex1.pdf",
+     "קודקס גופים מוסדרים — חלק 1"),
+    (f"{BLOB_BASE}Codex_codex2.pdf",
+     "קודקס גופים מוסדרים — חלק 2"),
+    (f"{BLOB_BASE}Codex_Gate5_Part2_Chapter2-signA.pdf",
+     "שער 5 חלק 2 פרק 2 — סימן א"),
+    (f"{BLOB_BASE}Codex_Gate5_Part2_Chapter1-signC-version7.pdf",
+     "שער 5 חלק 2 פרק 1 — סימן ג (גרסה 7)"),
+    (f"{BLOB_BASE}Codex_Gate5_Part1_Chapter4.docx",
+     "שער 5 חלק 1 פרק 4"),
+    (f"{BLOB_BASE}regulation_2022-11-06_final_word.pdf",
+     "תקנות — נובמבר 2022"),
+]
 
 
 class GovILCrawler:
     def __init__(self, db: Session):
         self.db = db
-        self._seen_urls: set[str] = set()
+        self._seen: set[str] = set()
 
-    # ------------------------------------------------------------------
-    # Entry point
-    # ------------------------------------------------------------------
+    # ─── Entry point ─────────────────────────────────────────────────────────
 
-    async def crawl(self, max_docs: int = 5000) -> int:
+    async def crawl(self, max_docs: int = 500) -> int:
         """
-        Crawl gov.il codex page and all linked regulation documents.
+        Crawl the gov.il codex page and index all regulation documents.
         Returns the number of documents saved/updated.
         """
         logger.info("Starting gov.il codex crawl…")
-        saved = 0
 
+        # Step 1 — discover document URLs
+        links = await self._discover_document_links()
+        logger.info(f"Discovered {len(links)} document links")
+
+        # Step 2 — download + index each document
+        saved = 0
         async with httpx.AsyncClient(
             headers=HEADERS,
-            timeout=30,
+            timeout=60,
             follow_redirects=True,
-            verify=False,  # Some gov.il certs can be problematic
+            verify=False,
         ) as client:
-            # Step 1: discover document URLs
-            doc_links = await self._discover_documents(client)
-            logger.info(f"Discovered {len(doc_links)} document links")
-
-            # Step 2: fetch + store each document
-            for i, (url, meta) in enumerate(doc_links[:max_docs]):
-                if url in self._seen_urls:
+            for url, title_hint in links[:max_docs]:
+                if url in self._seen:
                     continue
-                self._seen_urls.add(url)
-
+                self._seen.add(url)
                 try:
-                    title, content, category, doc_type, pub_date = (
-                        await self._fetch_document(client, url, meta)
+                    title, content, category, doc_type = await self._fetch_and_extract(
+                        client, url, title_hint
                     )
                     if title or content:
-                        self._upsert_document(
-                            url=url,
-                            title=title or url,
-                            content=content,
-                            category=category or meta.get("category", ""),
-                            document_type=doc_type or meta.get("type", "regulation"),
-                            published_date=pub_date or meta.get("date", ""),
-                            source_id=meta.get("source_id", ""),
-                        )
+                        self._upsert(url, title, content, category, doc_type)
                         saved += 1
-                        if saved % 50 == 0:
-                            logger.info(f"Saved {saved} documents so far…")
+                        if saved % 20 == 0:
+                            logger.info(f"  …{saved} documents indexed")
                 except Exception as e:
-                    logger.warning(f"Failed to process {url}: {e}")
+                    logger.warning(f"Skipping {url}: {e}")
 
-                # Polite crawl delay
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(0.8)  # polite delay
 
-        # Refresh all search vectors after bulk insert
         self._refresh_search_vectors()
-        logger.info(f"Crawl complete. Saved/updated {saved} documents.")
+        logger.info(f"Crawl complete — {saved} documents saved/updated.")
         return saved
 
-    # ------------------------------------------------------------------
-    # Discovery: find all document URLs on the codex page
-    # ------------------------------------------------------------------
+    # ─── Discovery: Playwright + fallback ────────────────────────────────────
 
-    async def _discover_documents(
-        self, client: httpx.AsyncClient
-    ) -> list[tuple[str, dict]]:
-        """Returns list of (url, metadata_dict)."""
-        links = []
-
-        # --- Attempt 1: gov.il internal JSON API ---
-        links += await self._discover_via_api(client)
-
-        # --- Attempt 2: HTML scraping of the codex index page ---
-        if len(links) < 10:
-            links += await self._discover_via_html(client)
-
-        # De-duplicate while preserving order
-        seen = set()
+    async def _discover_document_links(self) -> list[tuple[str, str]]:
+        """Return list of (url, title_hint). Tries Playwright first."""
+        links = await self._playwright_extract()
+        if not links:
+            logger.warning("Playwright extraction returned nothing — using known URL list")
+            links = list(KNOWN_URLS)
+        # De-duplicate preserving order
+        seen: set[str] = set()
         unique = []
-        for item in links:
-            if item[0] not in seen:
-                seen.add(item[0])
-                unique.append(item)
-
+        for url, title in links:
+            if url not in seen:
+                seen.add(url)
+                unique.append((url, title))
         return unique
 
-    async def _discover_via_api(
-        self, client: httpx.AsyncClient
-    ) -> list[tuple[str, dict]]:
-        """Try gov.il JSON API endpoints."""
-        links: list[tuple[str, dict]] = []
+    async def _playwright_extract(self) -> list[tuple[str, str]]:
+        """
+        Render the gov.il codex page with headless Chromium and extract every
+        link that points to a regulation document (PDF, DOCX, or BlobFolder path).
+        """
         try:
-            # The gov.il website exposes a JSON feed when called with the
-            # right Accept header
-            resp = await client.get(
-                CODEX_URL,
-                headers={**HEADERS, "Accept": "application/json"},
-            )
-            if resp.status_code == 200 and "application/json" in resp.headers.get(
-                "content-type", ""
-            ):
-                data = resp.json()
-                links += self._parse_api_response(data)
-                logger.info(f"API returned {len(links)} links")
-        except Exception as e:
-            logger.debug(f"API discovery failed: {e}")
+            from playwright.async_api import async_playwright, TimeoutError as PWTimeout
+        except ImportError:
+            logger.warning("playwright not installed — skipping headless extraction")
+            return []
 
-        # Also try the paginated list endpoint
+        links: list[tuple[str, str]] = []
         try:
-            for page in range(1, 20):
-                resp = await client.get(
-                    f"{GOVIL_BASE}/he/api/datagovil/datasetlist",
-                    params={"type": "codex", "page": page, "limit": 100},
-                    headers=HEADERS,
+            async with async_playwright() as pw:
+                browser = await pw.chromium.launch(
+                    headless=True,
+                    args=["--no-sandbox", "--disable-dev-shm-usage"],
                 )
-                if resp.status_code != 200:
-                    break
+                context = await browser.new_context(
+                    user_agent=HEADERS["User-Agent"],
+                    locale="he-IL",
+                    extra_http_headers={"Accept-Language": "he-IL,he;q=0.9"},
+                )
+                page = await context.new_page()
+
+                logger.info(f"Playwright: navigating to {CODEX_URL}")
                 try:
-                    data = resp.json()
-                    batch = self._parse_api_response(data)
-                    if not batch:
-                        break
-                    links += batch
-                except Exception:
-                    break
-        except Exception as e:
-            logger.debug(f"Paginated API failed: {e}")
+                    await page.goto(CODEX_URL, wait_until="networkidle", timeout=45_000)
+                except PWTimeout:
+                    # Even on timeout we may have partial DOM — continue
+                    logger.warning("Playwright: page load timed out, extracting partial DOM")
 
-        return links
+                # Extract every <a href> that looks like a document
+                raw_links: list[dict] = await page.evaluate("""
+                    () => {
+                        const results = [];
+                        document.querySelectorAll('a[href]').forEach(a => {
+                            const href = a.href || '';
+                            const text = (a.textContent || a.title || '').trim();
+                            const lower = href.toLowerCase();
+                            if (
+                                lower.includes('blobfolder') ||
+                                lower.endsWith('.pdf') ||
+                                lower.endsWith('.docx') ||
+                                lower.endsWith('.doc') ||
+                                lower.includes('information-entities-codex')
+                            ) {
+                                results.push({ href, text });
+                            }
+                        });
+                        return results;
+                    }
+                """)
 
-    def _parse_api_response(self, data) -> list[tuple[str, dict]]:
-        """Parse a gov.il JSON API response into (url, meta) pairs."""
-        links = []
-        items = []
+                for item in raw_links:
+                    href = item.get("href", "").strip()
+                    text = item.get("text", "").strip()
+                    if href and _is_document_url(href):
+                        links.append((href, text or _title_from_url(href)))
 
-        if isinstance(data, list):
-            items = data
-        elif isinstance(data, dict):
-            for key in ("items", "data", "results", "documents", "entities"):
-                if key in data and isinstance(data[key], list):
-                    items = data[key]
-                    break
-
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            url = (
-                item.get("url")
-                or item.get("link")
-                or item.get("pageUrl")
-                or item.get("pageurl")
-                or ""
-            )
-            if not url:
-                continue
-            if not url.startswith("http"):
-                url = urljoin(GOVIL_BASE, url)
-
-            meta = {
-                "title": item.get("title") or item.get("name") or "",
-                "category": item.get("category") or item.get("subject") or "",
-                "date": item.get("date") or item.get("publishDate") or "",
-                "source_id": str(item.get("id") or item.get("pageId") or ""),
-                "type": "regulation",
-            }
-            links.append((url, meta))
-
-        return links
-
-    async def _discover_via_html(
-        self, client: httpx.AsyncClient
-    ) -> list[tuple[str, dict]]:
-        """Scrape the codex HTML index page for document links."""
-        links: list[tuple[str, dict]] = []
-        try:
-            resp = await client.get(CODEX_URL)
-            resp.raise_for_status()
-            soup = BeautifulSoup(resp.text, "lxml")
-
-            # Remove nav/header noise
-            for tag in soup.find_all(["nav", "header", "footer"]):
-                tag.decompose()
-
-            for a_tag in soup.find_all("a", href=True):
-                href = a_tag["href"].strip()
-                if not href or href.startswith("#") or href.startswith("javascript"):
-                    continue
-
-                # Normalize URL
-                if href.startswith("/"):
-                    href = urljoin(GOVIL_BASE, href)
-                elif not href.startswith("http"):
-                    continue
-
-                # Only follow links back to gov.il
-                if "gov.il" not in urlparse(href).netloc:
-                    continue
-
-                title = a_tag.get_text(strip=True) or ""
-                meta = {
-                    "title": title,
-                    "category": "",
-                    "date": "",
-                    "source_id": "",
-                    "type": "pdf" if href.lower().endswith(".pdf") else "regulation",
-                }
-                links.append((href, meta))
-
-            logger.info(f"HTML scraping found {len(links)} links on codex page")
-
-            # Also follow sub-pages linked from the codex index
-            for a_tag in soup.find_all("a", href=True):
-                href = a_tag["href"]
-                if "/pages/" in href or "/codex/" in href:
-                    sub_url = urljoin(GOVIL_BASE, href)
-                    sub_links = await self._scrape_sub_index(client, sub_url)
-                    links += sub_links
+                logger.info(f"Playwright: extracted {len(links)} document links")
+                await browser.close()
 
         except Exception as e:
-            logger.warning(f"HTML discovery failed: {e}")
+            logger.error(f"Playwright extraction failed: {e}")
 
         return links
 
-    async def _scrape_sub_index(
-        self, client: httpx.AsyncClient, url: str
-    ) -> list[tuple[str, dict]]:
-        """Scrape a sub-index page for more document links."""
-        links = []
-        try:
-            resp = await client.get(url, timeout=15)
-            if resp.status_code != 200:
-                return []
-            soup = BeautifulSoup(resp.text, "lxml")
-            for a_tag in soup.find_all("a", href=True):
-                href = a_tag["href"]
-                if not href or href.startswith("#"):
-                    continue
-                full_url = urljoin(GOVIL_BASE, href)
-                if "gov.il" not in urlparse(full_url).netloc:
-                    continue
-                meta = {
-                    "title": a_tag.get_text(strip=True),
-                    "category": "",
-                    "date": "",
-                    "source_id": "",
-                    "type": "pdf" if href.lower().endswith(".pdf") else "regulation",
-                }
-                links.append((full_url, meta))
-        except Exception as e:
-            logger.debug(f"Sub-index scrape failed for {url}: {e}")
-        return links
+    # ─── Download + text extraction ──────────────────────────────────────────
 
-    # ------------------------------------------------------------------
-    # Document fetch + content extraction
-    # ------------------------------------------------------------------
-
-    async def _fetch_document(
-        self, client: httpx.AsyncClient, url: str, meta: dict
-    ) -> tuple[str, str, str, str, str]:
-        """
-        Fetch a document URL and extract (title, content, category, doc_type, pub_date).
-        Handles both HTML pages and PDF files.
-        """
-        resp = await client.get(url, timeout=30)
+    async def _fetch_and_extract(
+        self,
+        client: httpx.AsyncClient,
+        url: str,
+        title_hint: str,
+    ) -> tuple[str, str, str, str]:
+        """Download `url` and return (title, content, category, doc_type)."""
+        resp = await client.get(url)
         resp.raise_for_status()
 
-        content_type = resp.headers.get("content-type", "").lower()
+        raw_text = extract_text_from_bytes(resp.content, url)
 
-        if "pdf" in content_type or url.lower().endswith(".pdf"):
-            text_content = extract_text_from_pdf(resp.content)
-            title = meta.get("title") or _infer_title_from_url(url)
-            return (
-                title,
-                clean_text(text_content),
-                meta.get("category", ""),
-                "pdf",
-                meta.get("date", ""),
-            )
+        title = title_hint or _title_from_url(url)
+        category = _infer_category(url, raw_text)
+        doc_type = "pdf" if url.lower().endswith(".pdf") else \
+                   "docx" if url.lower().endswith((".docx", ".doc")) else "html"
 
-        # HTML document
-        title, body = extract_text_from_html(resp.text, base_url=url)
-        title = title or meta.get("title") or _infer_title_from_url(url)
+        return clean_text(title), clean_text(raw_text), category, doc_type
 
-        # Try to extract category / date from structured data or meta tags
-        soup = BeautifulSoup(resp.text, "lxml")
-        category = meta.get("category") or _extract_meta(soup, "category") or ""
-        pub_date = meta.get("date") or _extract_meta(soup, "date") or _extract_meta(soup, "publishDate") or ""
+    # ─── DB upsert ───────────────────────────────────────────────────────────
 
-        return (
-            clean_text(title),
-            clean_text(body),
-            category,
-            "regulation",
-            pub_date,
-        )
-
-    # ------------------------------------------------------------------
-    # Database upsert
-    # ------------------------------------------------------------------
-
-    def _upsert_document(
+    def _upsert(
         self,
         url: str,
         title: str,
         content: str,
         category: str,
-        document_type: str,
-        published_date: str,
-        source_id: str,
+        doc_type: str,
     ) -> None:
-        """Insert a new document or update its content if URL already exists."""
         try:
-            existing = (
-                self.db.query(Document).filter(Document.url == url).first()
-            )
+            existing = self.db.query(Document).filter(Document.url == url).first()
             if existing:
                 existing.title = title
                 existing.content = content
                 existing.category = category
-                existing.document_type = document_type
-                existing.published_date = published_date
+                existing.document_type = doc_type
             else:
-                doc = Document(
+                self.db.add(Document(
                     url=url,
                     title=title,
                     content=content,
                     category=category,
-                    document_type=document_type,
-                    published_date=published_date,
-                    source_id=source_id,
-                )
-                self.db.add(doc)
+                    document_type=doc_type,
+                    source_id=_source_id_from_url(url),
+                ))
             self.db.commit()
         except Exception as e:
             self.db.rollback()
             logger.error(f"DB upsert failed for {url}: {e}")
 
     def _refresh_search_vectors(self) -> None:
-        """Rebuild the tsvector column for all documents after bulk load."""
         try:
-            self.db.execute(
-                text(
-                    """
-                    UPDATE documents
-                    SET search_vector = to_tsvector(
-                        'simple',
-                        COALESCE(title, '') || ' ' || COALESCE(content, '')
-                    )
-                    WHERE search_vector IS NULL
-                       OR (updated_at > created_at AND search_vector IS NOT NULL)
-                    """
-                )
-            )
+            self.db.execute(text("""
+                UPDATE documents
+                SET search_vector =
+                    setweight(to_tsvector('simple', COALESCE(title, '')), 'A') ||
+                    setweight(to_tsvector('simple', COALESCE(content, '')), 'B')
+                WHERE search_vector IS NULL
+                   OR (updated_at IS NOT NULL AND updated_at > created_at)
+            """))
             self.db.commit()
             logger.info("Search vectors refreshed.")
         except Exception as e:
@@ -411,20 +263,49 @@ class GovILCrawler:
             logger.error(f"Vector refresh failed: {e}")
 
 
-# ------------------------------------------------------------------
-# Helpers
-# ------------------------------------------------------------------
+# ─── Helpers ─────────────────────────────────────────────────────────────────
 
-def _infer_title_from_url(url: str) -> str:
+def _is_document_url(url: str) -> bool:
+    lower = url.lower()
+    return (
+        "blobfolder" in lower
+        or lower.endswith(".pdf")
+        or lower.endswith(".docx")
+        or lower.endswith(".doc")
+    ) and "gov.il" in url
+
+
+def _title_from_url(url: str) -> str:
+    """Generate a readable Hebrew-friendly title from a URL path."""
     path = urlparse(url).path.rstrip("/")
-    slug = path.split("/")[-1] if "/" in path else path
-    return slug.replace("-", " ").replace("_", " ").title()
+    filename = path.split("/")[-1]
+    # Remove extension
+    name = re.sub(r"\.(pdf|docx?|xlsx?)$", "", filename, flags=re.I)
+    # Codex_Gate5_Part2_Chapter1-signC-version7 → readable label
+    name = name.replace("_", " ").replace("-", " — ")
+    return name.strip() or filename
 
 
-def _extract_meta(soup: BeautifulSoup, name: str) -> str:
-    tag = soup.find("meta", attrs={"name": name}) or soup.find(
-        "meta", attrs={"property": name}
-    )
-    if tag and tag.get("content"):
-        return tag["content"].strip()
-    return ""
+def _infer_category(url: str, content: str) -> str:
+    """Guess document category from filename or content keywords."""
+    lower = url.lower()
+    if "gate5" in lower or "שער5" in lower:
+        return "שער 5 — ביטוח"
+    if "gate4" in lower:
+        return "שער 4"
+    if "gate3" in lower:
+        return "שער 3"
+    if "gate2" in lower:
+        return "שער 2"
+    if "gate1" in lower:
+        return "שער 1"
+    if "regulation" in lower or "תקנות" in content[:200]:
+        return "תקנות"
+    if "codex" in lower:
+        return "קודקס"
+    return "גופים מוסדרים"
+
+
+def _source_id_from_url(url: str) -> str:
+    path = urlparse(url).path
+    return path.split("/")[-1]
