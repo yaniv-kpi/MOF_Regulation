@@ -1,8 +1,30 @@
 import axios from "axios";
 import type { SearchParams, SearchResponse, StatsResponse } from "./types";
 
+/**
+ * Resolve backend base URL at runtime so the same build works in both:
+ *  - Local dev  (localhost) → http://localhost:8000
+ *  - Deployed via experimentalServices → /_/backend  (same-origin, no port needed)
+ *
+ * Priority: NEXT_PUBLIC_API_URL env var → runtime hostname detection
+ */
+function resolveBaseURL(): string {
+  // Explicit override (set NEXT_PUBLIC_API_URL in .env.local for local dev if needed)
+  if (process.env.NEXT_PUBLIC_API_URL) return process.env.NEXT_PUBLIC_API_URL;
+
+  // Client-side runtime detection
+  if (typeof window !== "undefined") {
+    const { hostname } = window.location;
+    const isLocal = hostname === "localhost" || hostname === "127.0.0.1";
+    return isLocal ? "http://localhost:8000" : "/_/backend";
+  }
+
+  // SSR fallback (shouldn't be reached — all calls are "use client")
+  return "http://localhost:8000";
+}
+
 const api = axios.create({
-  baseURL: process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000",
+  baseURL: resolveBaseURL(),
   timeout: 10000,
   headers: { "Content-Type": "application/json" },
 });
