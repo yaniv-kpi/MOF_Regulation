@@ -1,147 +1,141 @@
 """
-Seed script — downloads and indexes a curated set of real documents
-directly from https://www.gov.il/BlobFolder/guide/information-entities-codex/he/
+Seed script — downloads and indexes real documents from gov.il codex.
 
-Run with:  python -m app.seed
+Run:  python -m app.seed
 
-This provides real, searchable data instantly without needing a full crawl.
-All "Open document" links point directly to gov.il.
+Downloads every confirmed document from
+  https://www.gov.il/BlobFolder/guide/information-entities-codex/he/
+extracts text (PDF via pypdf, DOCX via python-docx), and stores records
+with the ORIGINAL gov.il URL so search results link directly to the source.
 """
 
-import sys
-import os
-import asyncio
-import logging
-
-import httpx
+import sys, os, asyncio, logging
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
+import httpx
+from sqlalchemy import text as sqla_text
+
 from app.database import engine, SessionLocal
 from app.models import Base, Document
+from app.crawler.govil_crawler import (
+    _BASELINE_URLS,
+    _stage2_enumerate,
+    _title_from_url,
+    _infer_category,
+    _doc_type,
+    _fname,
+)
 from app.crawler.text_extractor import extract_text_from_bytes, clean_text
-from sqlalchemy import text
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
 logger = logging.getLogger(__name__)
 
-BLOB_BASE = "https://www.gov.il/BlobFolder/guide/information-entities-codex/he/"
-
-HEADERS = {
+_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
+        "Chrome/124.0.0.0 Safari/537.36"
     ),
     "Accept-Language": "he-IL,he;q=0.9",
 }
 
-# Real documents from the gov.il codex BlobFolder.
-# (url, title, category)
-SEED_DOCUMENTS = [
-    (
-        f"{BLOB_BASE}Codex_codex1.pdf",
-        "קודקס גופים מוסדרים — חלק 1",
-        "קודקס",
-    ),
-    (
-        f"{BLOB_BASE}Codex_codex2.pdf",
-        "קודקס גופים מוסדרים — חלק 2",
-        "קודקס",
-    ),
-    (
-        f"{BLOB_BASE}Codex_Gate5_Part2_Chapter2-signA.pdf",
-        "שער 5 — חלק 2, פרק 2, סימן א",
-        "שער 5 — ביטוח",
-    ),
-    (
-        f"{BLOB_BASE}Codex_Gate5_Part2_Chapter1-signC-version7.pdf",
-        "שער 5 — חלק 2, פרק 1, סימן ג (גרסה 7)",
-        "שער 5 — ביטוח",
-    ),
-    (
-        f"{BLOB_BASE}Codex_Gate5_Part1_Chapter4.docx",
-        "שער 5 — חלק 1, פרק 4",
-        "שער 5 — ביטוח",
-    ),
-    (
-        f"{BLOB_BASE}regulation_2022-11-06_final_word.pdf",
-        "תקנות — נובמבר 2022",
-        "תקנות",
-    ),
-]
+
+async def _collect_urls() -> list[tuple[str, str, str]]:
+    """
+    Build the list of (url, title, category) to seed.
+    Baseline list + URL enumeration (HEAD probes).
+    """
+    seen: dict[str, tuple[str, str, str]] = {
+        url: (url, title, cat) for url, title, cat in _BASELINE_URLS
+    }
+
+    # Run HEAD-request enumeration to discover additional documents
+    logger.info("Probing candidate URL patterns on gov.il…")
+    enum = await _stage2_enumerate()
+    added = 0
+    for url, title, cat in enum:
+        if url not in seen:
+            seen[url] = (url, title, cat)
+            added += 1
+    logger.info(f"Enumeration added {added} new URLs (total: {len(seen)})")
+
+    return list(seen.values())
 
 
-async def _download_and_extract(url: str) -> str:
-    """Download a document from gov.il and extract its text."""
+async def seed_async() -> None:
+    Base.metadata.create_all(bind=engine)
+    db = SessionLocal()
+
+    urls = await _collect_urls()
+    logger.info(f"\nDownloading and indexing {len(urls)} documents from gov.il…\n")
+
+    added = skipped = failed = 0
+
     async with httpx.AsyncClient(
-        headers=HEADERS,
+        headers=_HEADERS,
         timeout=60,
         follow_redirects=True,
         verify=False,
     ) as client:
-        resp = await client.get(url)
-        resp.raise_for_status()
-        text_content = extract_text_from_bytes(resp.content, url)
-        return clean_text(text_content)
+        for url, title, category in urls:
+            # Skip if already indexed
+            if db.query(Document).filter(Document.url == url).first():
+                skipped += 1
+                continue
 
+            try:
+                resp = await client.get(url)
+                resp.raise_for_status()
+                content = clean_text(extract_text_from_bytes(resp.content, url))
 
-async def seed_async():
-    Base.metadata.create_all(bind=engine)
-    db = SessionLocal()
-    added = 0
-    skipped = 0
-    failed = 0
+                if not content.strip():
+                    logger.warning(f"  empty content — skipping {_fname(url)}")
+                    failed += 1
+                    continue
 
-    for url, title, category in SEED_DOCUMENTS:
-        existing = db.query(Document).filter(Document.url == url).first()
-        if existing:
-            logger.info(f"  skip (exists): {title}")
-            skipped += 1
-            continue
+                db.add(Document(
+                    url=url,
+                    title=title,
+                    content=content,
+                    category=category,
+                    document_type=_doc_type(url),
+                    source_id=_fname(url),
+                ))
+                db.commit()
+                words = len(content.split())
+                logger.info(f"  ✓  {title}  ({words:,} words)")
+                added += 1
 
-        logger.info(f"  downloading: {url}")
-        try:
-            content = await _download_and_extract(url)
-            doc_type = "pdf" if url.lower().endswith(".pdf") else "docx"
-            doc = Document(
-                url=url,
-                title=title,
-                content=content,
-                category=category,
-                document_type=doc_type,
-                published_date="",
-                source_id=url.split("/")[-1],
-            )
-            db.add(doc)
-            db.commit()
-            word_count = len(content.split()) if content else 0
-            logger.info(f"  ✓ saved ({word_count} words): {title}")
-            added += 1
-        except Exception as e:
-            logger.warning(f"  ✗ failed ({url}): {e}")
-            failed += 1
+            except Exception as e:
+                logger.warning(f"  ✗  {_fname(url)}: {e}")
+                failed += 1
 
-    # Rebuild search vectors
+            await asyncio.sleep(0.3)
+
+    # Rebuild FTS search vectors
     try:
-        db.execute(text("""
+        db.execute(sqla_text("""
             UPDATE documents
             SET search_vector =
-                setweight(to_tsvector('simple', COALESCE(title, '')), 'A') ||
+                setweight(to_tsvector('simple', COALESCE(title,   '')), 'A') ||
                 setweight(to_tsvector('simple', COALESCE(content, '')), 'B')
             WHERE search_vector IS NULL
         """))
         db.commit()
     except Exception as e:
-        logger.warning(f"Vector refresh warning: {e}")
+        logger.warning(f"Vector rebuild warning: {e}")
 
     db.close()
-    print(f"\n✅ Seed complete: {added} added, {skipped} already existed, {failed} failed.")
-    if failed:
-        print("   Failed documents may be temporarily unavailable on gov.il.")
+    print(f"\n{'─'*50}")
+    print(f"  Added   : {added}")
+    print(f"  Skipped : {skipped} (already in DB)")
+    print(f"  Failed  : {failed}")
+    print(f"{'─'*50}")
+    print("  Seed complete — open http://localhost:3000 and search!")
 
 
-def seed():
+def seed() -> None:
     asyncio.run(seed_async())
 
 
