@@ -7,9 +7,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 
 from .config import settings
-from .database import engine, get_db, setup_db_extensions
+from .database import engine, get_db, setup_db_extensions, _IS_SQLITE
 from .models import Base
-from .schemas import CrawlStatusResponse, SearchResponse, StatsResponse
+from .schemas import CrawlStatusResponse, SearchResponse
 from .search import SearchService
 
 logging.basicConfig(
@@ -21,136 +21,100 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # ---- startup ----
-    logger.info("Initialising database…")
+    logger.info(f"Starting up — database: {'SQLite' if _IS_SQLITE else 'PostgreSQL'}")
     try:
         setup_db_extensions()
     except Exception as e:
-        logger.warning(f"Extension setup warning (non-fatal): {e}")
+        logger.warning(f"DB extensions (non-fatal): {e}")
 
+    # Create tables (works for both SQLite and PostgreSQL)
     Base.metadata.create_all(bind=engine)
 
-    # Create the tsvector update trigger
-    _create_tsvector_trigger()
+    # PostgreSQL-only: add search_vector column, GIN index, and trigger
+    if not _IS_SQLITE:
+        _setup_postgres_fts()
 
     logger.info("Database ready.")
     yield
-    # ---- shutdown ----
     logger.info("Shutting down.")
 
 
 app = FastAPI(
     title="Israeli Regulation Search",
-    description=(
-        "Full-text search engine for Israeli regulation documents sourced from gov.il"
-    ),
+    description="Full-text search engine for Israeli regulation documents from gov.il",
     version="1.0.0",
     lifespan=lifespan,
 )
 
+# ── CORS ──────────────────────────────────────────────────────────────────────
+# allow_credentials MUST be False when allow_origins=["*"].
+# The frontend does not send cookies so this is correct.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.CORS_ORIGINS + ["*"],
-    allow_credentials=True,
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-# ---------------------------------------------------------------------------
-# Search
-# ---------------------------------------------------------------------------
-
+# ── Search ────────────────────────────────────────────────────────────────────
 
 @app.get("/api/search", response_model=SearchResponse, tags=["search"])
 async def search(
-    q: str = Query(..., min_length=1, max_length=500, description="Search query (Hebrew supported)"),
+    q: str = Query(..., min_length=1, max_length=500),
     page: int = Query(1, ge=1, le=200),
     limit: int = Query(10, ge=1, le=50),
     category: Optional[str] = Query(None),
 ):
-    """
-    Full-text search across all indexed regulation documents.
-    Supports Hebrew and Latin text. Returns paginated results with snippets.
-    """
     db = next(get_db())
     try:
-        service = SearchService(db)
-        return service.search(q, page=page, limit=limit, category=category)
+        return SearchService(db).search(q, page=page, limit=limit, category=category)
     except Exception as e:
-        logger.error(f"Search error for query '{q}': {e}", exc_info=True)
+        logger.error(f"Search error '{q}': {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Search service error")
     finally:
         db.close()
 
 
-# ---------------------------------------------------------------------------
-# Suggestions (autocomplete)
-# ---------------------------------------------------------------------------
-
-
 @app.get("/api/suggest", tags=["search"])
-async def suggest(
-    q: str = Query(..., min_length=1, max_length=200),
-):
-    """Return up to 8 title suggestions for autocomplete."""
+async def suggest(q: str = Query(..., min_length=1, max_length=200)):
     db = next(get_db())
     try:
-        service = SearchService(db)
-        return {"suggestions": service.get_suggestions(q)}
+        return {"suggestions": SearchService(db).get_suggestions(q)}
     finally:
         db.close()
-
-
-# ---------------------------------------------------------------------------
-# Categories
-# ---------------------------------------------------------------------------
 
 
 @app.get("/api/categories", tags=["metadata"])
 async def get_categories():
     db = next(get_db())
     try:
-        service = SearchService(db)
-        return {"categories": service.get_categories()}
+        return {"categories": SearchService(db).get_categories()}
     finally:
         db.close()
-
-
-# ---------------------------------------------------------------------------
-# Stats
-# ---------------------------------------------------------------------------
 
 
 @app.get("/api/stats", tags=["metadata"])
 async def get_stats():
     db = next(get_db())
     try:
-        service = SearchService(db)
-        return service.get_stats()
+        return SearchService(db).get_stats()
     finally:
         db.close()
 
 
-# ---------------------------------------------------------------------------
-# Crawl trigger
-# ---------------------------------------------------------------------------
-
+# ── Crawl trigger ─────────────────────────────────────────────────────────────
 
 @app.post("/api/crawl", response_model=CrawlStatusResponse, tags=["admin"])
 async def trigger_crawl(background_tasks: BackgroundTasks):
-    """
-    Start a background crawl of gov.il codex documents.
-    The crawl runs asynchronously — check /api/stats to track progress.
-    """
     from .crawler.govil_crawler import GovILCrawler
 
     async def _run():
         db = next(get_db())
         try:
-            crawler = GovILCrawler(db)
-            count = await crawler.crawl()
-            logger.info(f"Background crawl complete: {count} documents saved.")
+            count = await GovILCrawler(db).crawl()
+            logger.info(f"Crawl complete: {count} documents saved.")
         except Exception as e:
             logger.error(f"Crawl failed: {e}", exc_info=True)
         finally:
@@ -159,45 +123,52 @@ async def trigger_crawl(background_tasks: BackgroundTasks):
     background_tasks.add_task(_run)
     return CrawlStatusResponse(
         status="started",
-        message="Crawl started in background. Use GET /api/stats to monitor progress.",
+        message="Crawl running in background — check GET /api/stats for progress.",
     )
 
 
-# ---------------------------------------------------------------------------
-# Healthcheck
-# ---------------------------------------------------------------------------
-
+# ── Health ────────────────────────────────────────────────────────────────────
 
 @app.get("/health", tags=["ops"])
 async def health():
     db = next(get_db())
     try:
         db.execute(text("SELECT 1"))
-        db_status = "ok"
+        db_ok = True
     except Exception:
-        db_status = "error"
+        db_ok = False
     finally:
         db.close()
-    return {"status": "ok", "database": db_status}
+    return {
+        "status": "ok",
+        "database": "ok" if db_ok else "error",
+        "db_type": "sqlite" if _IS_SQLITE else "postgresql",
+    }
 
 
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
+# ── PostgreSQL FTS setup ──────────────────────────────────────────────────────
 
-
-def _create_tsvector_trigger() -> None:
+def _setup_postgres_fts() -> None:
     """
-    Create a PostgreSQL trigger that auto-updates the search_vector column
-    on every INSERT or UPDATE of a document row.
-    Uses the 'simple' text search configuration — works for Hebrew Unicode text.
+    Add search_vector TSVECTOR column (if missing), a GIN index, and a trigger
+    that keeps it up to date. Safe to run on every startup (all statements are
+    idempotent).
     """
     sql = """
+    ALTER TABLE documents ADD COLUMN IF NOT EXISTS
+        search_vector TSVECTOR;
+
+    CREATE INDEX IF NOT EXISTS idx_documents_search_vector
+        ON documents USING GIN(search_vector);
+
+    CREATE INDEX IF NOT EXISTS idx_documents_title_trgm
+        ON documents USING GIN(title gin_trgm_ops);
+
     CREATE OR REPLACE FUNCTION documents_search_vector_update()
     RETURNS TRIGGER AS $$
     BEGIN
         NEW.search_vector :=
-            setweight(to_tsvector('simple', coalesce(NEW.title, '')), 'A') ||
+            setweight(to_tsvector('simple', coalesce(NEW.title,   '')), 'A') ||
             setweight(to_tsvector('simple', coalesce(NEW.content, '')), 'B');
         RETURN NEW;
     END;
@@ -213,6 +184,6 @@ def _create_tsvector_trigger() -> None:
         with engine.connect() as conn:
             conn.execute(text(sql))
             conn.commit()
-        logger.info("tsvector trigger created/updated.")
+        logger.info("PostgreSQL FTS column / index / trigger ready.")
     except Exception as e:
-        logger.warning(f"tsvector trigger setup warning: {e}")
+        logger.warning(f"PostgreSQL FTS setup warning (non-fatal): {e}")
